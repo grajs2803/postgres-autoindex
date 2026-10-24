@@ -479,7 +479,7 @@
 #recursive_worktable_factor = 10.0	# range 0.001-1000000
 #auto_index_enabled = on
 #auto_index_min_scans = 10
-
+#auto_index_database = 'postgres'	
 #------------------------------------------------------------------------------
 # REPORTING AND LOGGING
 #------------------------------------------------------------------------------

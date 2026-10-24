@@ -107,6 +107,7 @@
 #include "postmaster/syslogger.h"
 #include "postmaster/walsummarizer.h"
 #include "replication/logicallauncher.h"
+#include "executor/autoindex.h"
 #include "replication/slotsync.h"
 #include "replication/walsender.h"
 #include "storage/aio_subsys.h"
@@ -926,6 +927,7 @@ PostmasterMain(int argc, char *argv[])
 	 * before any modules had a chance to take the background worker slots.
 	 */
 	ApplyLauncherRegister();
+	AutoIndexWorkerRegister();
 
 	/*
 	 * process any libraries that should be preloaded at postmaster start

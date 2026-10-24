@@ -23,10 +23,25 @@
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/relcache.h"
+#include "access/relation.h"
+#include "access/xact.h"
+#include "executor/spi.h"
+#include "pgstat.h"
+#include "postmaster/bgworker.h"
+#include "postmaster/interrupt.h"
+#include "storage/latch.h"
+#include "tcop/tcopprot.h"
+#include "utils/guc.h"
+#include "utils/snapmgr.h"
+#include "utils/wait_event.h"
 
 /* GUCs */
 bool		auto_index_enabled = true;
 int			auto_index_min_scans = 10;
+char	   *auto_index_database = NULL;
+
+/* How often the worker wakes up to look for work. */
+#define AUTOINDEX_NAPTIME_MS	10000
 
 #define AUTOINDEX_MAX_ENTRIES	1024
 #define AUTOINDEX_BTREE_FANOUT	256.0
@@ -46,6 +61,7 @@ typedef struct AutoIndexEntry
 	double		total_savings;
 	double		build_cost;
 	bool		recommended;
+	bool		attempted;		/* worker has tried to build it (never retry) */
 } AutoIndexEntry;
 
 typedef struct AutoIndexSharedState
@@ -254,6 +270,7 @@ AutoIndexRecord(Relation rel, AttrNumber attno, double seq_cost, double nrows)
 		entry->nscans = 0;
 		entry->total_savings = 0;
 		entry->recommended = false;
+		entry->attempted = false;
 	}
 	entry->nscans++;
 	if (savings > 0)
@@ -321,4 +338,140 @@ AutoIndexObserveSeqScan(SeqScan *node, Relation rel,
 						node->scan.plan.total_cost,
 						node->scan.plan.plan_rows);
 	}
+}
+
+/* ---------------------------------------------------------------------
+ * Background worker: turn recommendations into real indexes.
+ * ---------------------------------------------------------------------
+ */
+
+/* Build one index.  Runs in its own transaction. */
+static void
+AutoIndexBuild(Oid relid, AttrNumber attno)
+{
+	Relation	rel;
+	StringInfoData sql;
+	bool		build = false;
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	/* Table may have been dropped since we recorded it. */
+	rel = try_relation_open(relid, AccessShareLock);
+	if (rel != NULL)
+	{
+		char	   *attname = get_attname(relid, attno, true);
+
+		/* Someone (maybe a human) may have created it meanwhile. */
+		if (attname != NULL && !AutoIndexHasLeadingIndex(rel, attno))
+		{
+			initStringInfo(&sql);
+			appendStringInfo(&sql, "CREATE INDEX ON %s (%s)",
+							 quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
+														RelationGetRelationName(rel)),
+							 quote_identifier(attname));
+			build = true;
+		}
+		relation_close(rel, AccessShareLock);
+	}
+
+	if (build)
+	{
+		pgstat_report_activity(STATE_RUNNING, sql.data);
+		SPI_connect();
+		/* Don't queue behind a long transaction holding a conflicting lock. */
+		SPI_execute("SET LOCAL lock_timeout = '5s'", false, 0);
+		if (SPI_execute(sql.data, false, 0) == SPI_OK_UTILITY)
+			ereport(LOG, (errmsg("auto_index: created index: %s", sql.data)));
+		SPI_finish();
+	}
+
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	pgstat_report_activity(STATE_IDLE, NULL);
+}
+
+/* Build every pending recommendation for the database we're connected to. */
+static void
+AutoIndexCreatePending(void)
+{
+	for (;;)
+	{
+		HASH_SEQ_STATUS status;
+		AutoIndexEntry *entry;
+		Oid			relid = InvalidOid;
+		AttrNumber	attno = 0;
+
+		/* Claim one entry under the lock... */
+		LWLockAcquire(&AutoIndexState->lock, LW_EXCLUSIVE);
+		hash_seq_init(&status, AutoIndexHash);
+		while ((entry = (AutoIndexEntry *) hash_seq_search(&status)) != NULL)
+		{
+			if (entry->recommended && !entry->attempted &&
+				entry->key.dbid == MyDatabaseId)
+			{
+				entry->attempted = true;
+				relid = entry->key.relid;
+				attno = entry->key.attno;
+				hash_seq_term(&status);		/* required when leaving a scan early */
+				break;
+			}
+		}
+		LWLockRelease(&AutoIndexState->lock);
+
+		/* ...and do the slow work without it. */
+		if (!OidIsValid(relid))
+			return;
+		AutoIndexBuild(relid, attno);
+	}
+}
+
+void
+AutoIndexWorkerMain(Datum main_arg)
+{
+	pqsignal(SIGTERM, die);
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	BackgroundWorkerUnblockSignals();
+
+	BackgroundWorkerInitializeConnection(auto_index_database, NULL, 0);
+
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		if (ConfigReloadPending)
+		{
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+
+		if (auto_index_enabled)
+			AutoIndexCreatePending();
+
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 AUTOINDEX_NAPTIME_MS, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+	}
+}
+
+/* Called once by the postmaster at startup. */
+void
+AutoIndexWorkerRegister(void)
+{
+	BackgroundWorker bgw;
+
+	if (IsBinaryUpgrade)
+		return;
+
+	memset(&bgw, 0, sizeof(bgw));
+	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	bgw.bgw_restart_time = 10;	/* seconds; worker is restarted after an ERROR */
+	snprintf(bgw.bgw_library_name, sizeof(bgw.bgw_library_name), "postgres");
+	snprintf(bgw.bgw_function_name, sizeof(bgw.bgw_function_name), "AutoIndexWorkerMain");
+	snprintf(bgw.bgw_name, sizeof(bgw.bgw_name), "auto index worker");
+	snprintf(bgw.bgw_type, sizeof(bgw.bgw_type), "auto index worker");
+	RegisterBackgroundWorker(&bgw);
 }

@@ -4169,6 +4169,16 @@ struct config_real ConfigureNamesReal[] =
 struct config_string ConfigureNamesString[] =
 {
 	{
+		{"auto_index_database", PGC_POSTMASTER, QUERY_TUNING_OTHER,
+			gettext_noop("Database in which the auto index worker creates indexes."),
+			NULL
+		},
+		&auto_index_database,
+		"postgres",
+		NULL, NULL, NULL
+	},
+	{
+
 		{"archive_command", PGC_SIGHUP, WAL_ARCHIVING,
 			gettext_noop("Sets the shell command that will be called to archive a WAL file."),
 			gettext_noop("An empty string means use \"archive_library\".")

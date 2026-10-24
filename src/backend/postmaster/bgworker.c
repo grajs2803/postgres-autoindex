@@ -20,6 +20,7 @@
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/postmaster.h"
 #include "replication/logicallauncher.h"
+#include "executor/autoindex.h"
 #include "replication/logicalworker.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -120,6 +121,9 @@ static const struct
 {
 	{
 		"ParallelWorkerMain", ParallelWorkerMain
+	},
+	{
+		"AutoIndexWorkerMain", AutoIndexWorkerMain
 	},
 	{
 		"ApplyLauncherMain", ApplyLauncherMain
