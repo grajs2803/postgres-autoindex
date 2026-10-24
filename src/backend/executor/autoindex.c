@@ -36,11 +36,26 @@
 #include "tcop/dest.h"
 #include "tcop/utility.h"
 #include "utils/memutils.h"
+#include "access/itup.h"
+#include "access/nbtree.h"
+#include "executor/spi.h"
+#include "storage/bufpage.h"
+
+
+
 
 /* GUCs */
 bool		auto_index_enabled = true;
 int			auto_index_min_scans = 10;
 char	   *auto_index_database = NULL;
+int			auto_index_max_per_table = 3;
+int			auto_index_max_size_mb = 1024;
+
+/* Every index we create is named autoidx_<tableoid>_<attno>. */
+#define AUTOINDEX_NAME_PREFIX	"autoidx_"
+
+/* After this many failed builds of the same candidate, give up for good. */
+#define AUTOINDEX_MAX_FAILURES	3
 
 /* How often the worker wakes up to look for work. */
 #define AUTOINDEX_NAPTIME_MS	10000
@@ -64,6 +79,7 @@ typedef struct AutoIndexEntry
 	double		build_cost;
 	bool		recommended;
 	bool		attempted;		/* worker has tried to build it (never retry) */
+	int			failures;		/* failed builds so far (drives backoff) */
 } AutoIndexEntry;
 
 typedef struct AutoIndexSharedState
@@ -273,6 +289,7 @@ AutoIndexRecord(Relation rel, AttrNumber attno, double seq_cost, double nrows)
 		entry->total_savings = 0;
 		entry->recommended = false;
 		entry->attempted = false;
+		entry->failures = 0;
 	}
 	entry->nscans++;
 	if (savings > 0)
@@ -280,7 +297,7 @@ AutoIndexRecord(Relation rel, AttrNumber attno, double seq_cost, double nrows)
 	entry->build_cost = build_cost;
 
 	if (!entry->recommended &&
-		entry->nscans >= auto_index_min_scans &&
+		entry->nscans >= ((int64) auto_index_min_scans << entry->failures) &&
 		entry->total_savings > entry->build_cost)
 	{
 		entry->recommended = true;
@@ -341,6 +358,94 @@ AutoIndexObserveSeqScan(SeqScan *node, Relation rel,
 						node->scan.plan.plan_rows);
 	}
 }
+
+/* How many indexes on this table did *we* create? */
+static int
+AutoIndexCountOurs(Relation rel)
+{
+	List	   *indexes = RelationGetIndexList(rel);
+	ListCell   *lc;
+	int			n = 0;
+
+	foreach(lc, indexes)
+	{
+		char	   *name = get_rel_name(lfirst_oid(lc));
+
+		if (name != NULL &&
+			strncmp(name, AUTOINDEX_NAME_PREFIX, strlen(AUTOINDEX_NAME_PREFIX)) == 0)
+			n++;
+	}
+	list_free(indexes);
+	return n;
+}
+
+
+/*
+ * Estimate the size of a single-column btree before building it.
+ *
+ *	 per-entry bytes = MAXALIGN(IndexTupleData + key width) + ItemIdData
+ *	 usable per page = (BLCKSZ - page header - btree special) * fillfactor
+ *	 leaf pages      = ceil(N * entry / usable)
+ *
+ * Inner pages add only ~1/fanout (<1%) on top, so we ignore them.
+ */
+static double
+AutoIndexEstimateSizeMB(Relation rel, AttrNumber attno)
+{
+	Oid			relid = RelationGetRelid(rel);
+	double		ntuples = Max(rel->rd_rel->reltuples, 0);
+	int32		width = get_attavgwidth(relid, attno);	/* from ANALYZE */
+	double		entry_bytes;
+	double		usable;
+	double		pages;
+
+	if (width <= 0)				/* no stats: fall back to the type's typical width */
+	{
+		Oid			typid;
+		int32		typmod;
+		Oid			collid;
+
+		get_atttypetypmodcoll(relid, attno, &typid, &typmod, &collid);
+		width = get_typavgwidth(typid, typmod);
+	}
+
+	entry_bytes = MAXALIGN(sizeof(IndexTupleData) + width) + sizeof(ItemIdData);
+	usable = (BLCKSZ - SizeOfPageHeaderData - MAXALIGN(sizeof(BTPageOpaqueData))) *
+		(BTREE_DEFAULT_FILLFACTOR / 100.0);
+	pages = ceil(ntuples * entry_bytes / usable);
+
+	return pages * BLCKSZ / (1024.0 * 1024.0);
+}
+
+/* A build failed: count it, and unless we've given up, make it re-earn evidence. */
+static void
+AutoIndexNoteFailure(Oid relid, AttrNumber attno)
+{
+	AutoIndexKey key;
+	AutoIndexEntry *entry;
+
+	memset(&key, 0, sizeof(key));
+	key.dbid = MyDatabaseId;
+	key.relid = relid;
+	key.attno = attno;
+
+	LWLockAcquire(&AutoIndexState->lock, LW_EXCLUSIVE);
+	entry = (AutoIndexEntry *) hash_search(AutoIndexHash, &key, HASH_FIND, NULL);
+	if (entry != NULL)
+	{
+		entry->failures++;
+		if (entry->failures < AUTOINDEX_MAX_FAILURES)
+		{
+			entry->nscans = 0;
+			entry->total_savings = 0;
+			entry->recommended = false;
+			entry->attempted = false;
+		}
+		/* else: leave attempted = true -> permanently retired */
+	}
+	LWLockRelease(&AutoIndexState->lock);
+}
+
 
 /*
  * Run one SQL statement exactly as if a client had sent it, so commands
@@ -415,12 +520,34 @@ AutoIndexBuild(Oid relid, AttrNumber attno)
 
 		if (attname != NULL && !AutoIndexHasLeadingIndex(rel, attno))
 		{
-			initStringInfo(&sql);
-			appendStringInfo(&sql, "CREATE INDEX CONCURRENTLY ON %s (%s)",
-							 quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
-														RelationGetRelationName(rel)),
-							 quote_identifier(attname));
-			build = true;
+			int			ours = AutoIndexCountOurs(rel);
+			double		est_mb = AutoIndexEstimateSizeMB(rel, attno);
+
+			if (ours >= auto_index_max_per_table)
+				ereport(LOG,
+						(errmsg("auto_index: skipping %s (%s): table already has %d auto indexes",
+								RelationGetRelationName(rel), attname, ours),
+						 errhint("Raise auto_index_max_per_table to allow more.")));
+			else if (est_mb > auto_index_max_size_mb)
+				ereport(LOG,
+						(errmsg("auto_index: skipping %s (%s): estimated size %.0f MB exceeds auto_index_max_size_mb = %d",
+								RelationGetRelationName(rel), attname, est_mb,
+								auto_index_max_size_mb)));
+			else
+			{
+				MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
+				initStringInfo(&sql);
+				MemoryContextSwitchTo(old);
+				appendStringInfo(&sql,
+								 "CREATE INDEX CONCURRENTLY IF NOT EXISTS " AUTOINDEX_NAME_PREFIX "%u_%d ON %s (%s)",
+								 relid, (int) attno,
+								 quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
+															RelationGetRelationName(rel)),
+								 quote_identifier(attname));
+				build = true;
+				ereport(LOG, (errmsg("auto_index: building, estimated size %.1f MB", est_mb)));
+			}
 		}
 		relation_close(rel, AccessShareLock);
 	}
@@ -435,6 +562,80 @@ AutoIndexBuild(Oid relid, AttrNumber attno)
 
 	CommitTransactionCommand();
 	pgstat_report_activity(STATE_IDLE, NULL);
+}
+/*
+ * Drop INVALID indexes we created (leftovers of failed CIC builds).
+ * Only names with our prefix are touched -- never a human's index.
+ */
+static void
+AutoIndexCleanupInvalid(void)
+{
+	MemoryContext keep;
+	MemoryContext old;
+	List	   *qualnames = NIL;
+	List	   *relnames = NIL;
+	ListCell   *lc1;
+	ListCell   *lc2;
+
+	/* Survives the commits that DROP INDEX CONCURRENTLY does internally. */
+	keep = AllocSetContextCreate(TopMemoryContext, "AutoIndex cleanup",
+								 ALLOCSET_SMALL_SIZES);
+
+	/* 1. Find them (read-only catalog query via SPI). */
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	SPI_connect();
+	if (SPI_execute("SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname), c.relname "
+					"FROM pg_index i "
+					"JOIN pg_class c ON c.oid = i.indexrelid "
+					"JOIN pg_namespace n ON n.oid = c.relnamespace "
+					"WHERE NOT i.indisvalid AND c.relname LIKE 'autoidx\\_%'",
+					true, 0) == SPI_OK_SELECT)
+	{
+		for (uint64 i = 0; i < SPI_processed; i++)
+		{
+			HeapTuple	tup = SPI_tuptable->vals[i];
+			TupleDesc	desc = SPI_tuptable->tupdesc;
+
+			old = MemoryContextSwitchTo(keep);
+			qualnames = lappend(qualnames, pstrdup(SPI_getvalue(tup, desc, 1)));
+			relnames = lappend(relnames, pstrdup(SPI_getvalue(tup, desc, 2)));
+			MemoryContextSwitchTo(old);
+		}
+	}
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	/* 2. Drop each one in its own transaction, then do the bookkeeping. */
+	forboth(lc1, qualnames, lc2, relnames)
+	{
+		char	   *qualname = (char *) lfirst(lc1);
+		char	   *relname = (char *) lfirst(lc2);
+		char	   *sql;
+		unsigned int relid;
+		int			attno;
+
+		old = MemoryContextSwitchTo(keep);
+		sql = psprintf("DROP INDEX CONCURRENTLY IF EXISTS %s", qualname);
+		MemoryContextSwitchTo(old);
+
+		SetCurrentStatementStartTimestamp();
+		StartTransactionCommand();
+		pgstat_report_activity(STATE_RUNNING, sql);
+		AutoIndexRunTopLevel(sql);
+		CommitTransactionCommand();
+		pgstat_report_activity(STATE_IDLE, NULL);
+
+		ereport(LOG, (errmsg("auto_index: dropped invalid index %s", qualname)));
+
+		/* The deterministic name tells us exactly which candidate failed. */
+		if (sscanf(relname, AUTOINDEX_NAME_PREFIX "%u_%d", &relid, &attno) == 2)
+			AutoIndexNoteFailure((Oid) relid, (AttrNumber) attno);
+	}
+
+	MemoryContextDelete(keep);
 }
 /* Build every pending recommendation for the database we're connected to. */
 static void
@@ -493,7 +694,10 @@ AutoIndexWorkerMain(Datum main_arg)
 		}
 
 		if (auto_index_enabled)
+		{
+			AutoIndexCleanupInvalid();
 			AutoIndexCreatePending();
+		}
 
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

@@ -14,6 +14,8 @@
 extern PGDLLIMPORT bool auto_index_enabled;
 extern PGDLLIMPORT int auto_index_min_scans;
 extern PGDLLIMPORT char *auto_index_database;
+extern PGDLLIMPORT int auto_index_max_per_table;
+extern PGDLLIMPORT int auto_index_max_size_mb;
 
 extern Size AutoIndexShmemSize(void);
 extern void AutoIndexShmemInit(void);

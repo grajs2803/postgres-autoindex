@@ -480,6 +480,8 @@
 #auto_index_enabled = on
 #auto_index_min_scans = 10
 #auto_index_database = 'postgres'	
+#auto_index_max_per_table = 3
+#auto_index_max_size_mb = 1024
 #------------------------------------------------------------------------------
 # REPORTING AND LOGGING
 #------------------------------------------------------------------------------
