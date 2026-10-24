@@ -13,6 +13,7 @@ top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	autoindex.o \
 	execAmi.o \
 	execAsync.o \
 	execCurrent.o \
@@ -77,6 +78,7 @@ OBJS = \
 	nodeWorktablescan.o \
 	spi.o \
 	tqueue.o \
-	tstoreReceiver.o
+	tstoreReceiver.o \
+	autoindex.o 
 
 include $(top_srcdir)/src/backend/common.mk
