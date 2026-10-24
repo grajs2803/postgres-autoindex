@@ -2172,6 +2172,24 @@ struct config_int ConfigureNamesInt[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"auto_index_max_per_table", PGC_SIGHUP, QUERY_TUNING_OTHER,
+			gettext_noop("Maximum number of automatically created indexes per table."),
+			NULL
+		},
+		&auto_index_max_per_table,
+		3, 0, 1000,
+		NULL, NULL, NULL
+	},
+	{
+		{"auto_index_max_size_mb", PGC_SIGHUP, QUERY_TUNING_OTHER,
+			gettext_noop("Skip automatic indexes whose estimated size exceeds this many megabytes."),
+			NULL
+		},
+		&auto_index_max_size_mb,
+		1024, 1, INT_MAX,
+		NULL, NULL, NULL
+	},
+	{
 		{"post_auth_delay", PGC_BACKEND, DEVELOPER_OPTIONS,
 			gettext_noop("Sets the amount of time to wait after "
 						 "authentication on connection startup."),
@@ -4168,24 +4186,7 @@ struct config_real ConfigureNamesReal[] =
 
 struct config_string ConfigureNamesString[] =
 {
-	{
-		{"auto_index_max_per_table", PGC_SIGHUP, QUERY_TUNING_OTHER,
-			gettext_noop("Maximum number of automatically created indexes per table."),
-			NULL
-		},
-		&auto_index_max_per_table,
-		3, 0, 1000,
-		NULL, NULL, NULL
-	},
-	{
-		{"auto_index_max_size_mb", PGC_SIGHUP, QUERY_TUNING_OTHER,
-			gettext_noop("Skip automatic indexes whose estimated size exceeds this many megabytes."),
-			NULL
-		},
-		&auto_index_max_size_mb,
-		1024, 1, INT_MAX,
-		NULL, NULL, NULL
-	},
+
 	{
 		{"auto_index_database", PGC_POSTMASTER, QUERY_TUNING_OTHER,
 			gettext_noop("Database in which the auto index worker creates indexes."),
