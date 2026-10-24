@@ -25,7 +25,6 @@
 #include "utils/relcache.h"
 #include "access/relation.h"
 #include "access/xact.h"
-#include "executor/spi.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
@@ -34,6 +33,9 @@
 #include "utils/guc.h"
 #include "utils/snapmgr.h"
 #include "utils/wait_event.h"
+#include "tcop/dest.h"
+#include "tcop/utility.h"
+#include "utils/memutils.h"
 
 /* GUCs */
 bool		auto_index_enabled = true;
@@ -340,6 +342,54 @@ AutoIndexObserveSeqScan(SeqScan *node, Relation rel,
 	}
 }
 
+/*
+ * Run one SQL statement exactly as if a client had sent it, so commands
+ * that must be top-level (CREATE INDEX CONCURRENTLY) are allowed.
+ *
+ * CIC commits our transaction internally, which frees every transaction-
+ * scoped memory context.  So the parse/plan trees must live in a context
+ * that survives commits -- the same reason exec_simple_query() parses in
+ * MessageContext instead of the transaction's context.
+ */
+static void
+AutoIndexRunTopLevel(const char *sql)
+{
+	MemoryContext stmtcxt;
+	List	   *parsetrees;
+	List	   *querytrees;
+	List	   *plantrees;
+	PlannedStmt *pstmt;
+
+	stmtcxt = AllocSetContextCreate(TopMemoryContext, "AutoIndex statement",
+									ALLOCSET_DEFAULT_SIZES);
+	MemoryContextSwitchTo(stmtcxt);
+
+	parsetrees = pg_parse_query(sql);
+	Assert(list_length(parsetrees) == 1);
+	querytrees = pg_analyze_and_rewrite_fixedparams(linitial_node(RawStmt, parsetrees),
+													sql, NULL, 0, NULL);
+	plantrees = pg_plan_queries(querytrees, sql, CURSOR_OPT_PARALLEL_OK, NULL);
+	pstmt = linitial_node(PlannedStmt, plantrees);
+
+	/* Same snapshot dance as PortalRunUtility(); CIC pops it itself. */
+	PushActiveSnapshot(GetTransactionSnapshot());
+	ProcessUtility(pstmt, sql, false, PROCESS_UTILITY_TOPLEVEL,
+				   NULL, NULL, None_Receiver, NULL);
+	if (ActiveSnapshotSet())
+		PopActiveSnapshot();
+
+	/*
+	 * Don't switch back to the context we started in: it belonged to a
+	 * transaction CIC already committed.  Use the current transaction's.
+	 */
+	MemoryContextSwitchTo(TopTransactionContext);
+	MemoryContextDelete(stmtcxt);
+}
+
+
+
+
+
 /* ---------------------------------------------------------------------
  * Background worker: turn recommendations into real indexes.
  * ---------------------------------------------------------------------
@@ -355,19 +405,18 @@ AutoIndexBuild(Oid relid, AttrNumber attno)
 
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
-	PushActiveSnapshot(GetTransactionSnapshot());
 
-	/* Table may have been dropped since we recorded it. */
+	/* Validation needs a snapshot; release it before CIC (CIC wants a clean stack). */
+	PushActiveSnapshot(GetTransactionSnapshot());
 	rel = try_relation_open(relid, AccessShareLock);
 	if (rel != NULL)
 	{
 		char	   *attname = get_attname(relid, attno, true);
 
-		/* Someone (maybe a human) may have created it meanwhile. */
 		if (attname != NULL && !AutoIndexHasLeadingIndex(rel, attno))
 		{
 			initStringInfo(&sql);
-			appendStringInfo(&sql, "CREATE INDEX ON %s (%s)",
+			appendStringInfo(&sql, "CREATE INDEX CONCURRENTLY ON %s (%s)",
 							 quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
 														RelationGetRelationName(rel)),
 							 quote_identifier(attname));
@@ -375,23 +424,18 @@ AutoIndexBuild(Oid relid, AttrNumber attno)
 		}
 		relation_close(rel, AccessShareLock);
 	}
+	PopActiveSnapshot();
 
 	if (build)
 	{
 		pgstat_report_activity(STATE_RUNNING, sql.data);
-		SPI_connect();
-		/* Don't queue behind a long transaction holding a conflicting lock. */
-		SPI_execute("SET LOCAL lock_timeout = '5s'", false, 0);
-		if (SPI_execute(sql.data, false, 0) == SPI_OK_UTILITY)
-			ereport(LOG, (errmsg("auto_index: created index: %s", sql.data)));
-		SPI_finish();
+		AutoIndexRunTopLevel(sql.data);
+		ereport(LOG, (errmsg("auto_index: created index: %s", sql.data)));
 	}
 
-	PopActiveSnapshot();
 	CommitTransactionCommand();
 	pgstat_report_activity(STATE_IDLE, NULL);
 }
-
 /* Build every pending recommendation for the database we're connected to. */
 static void
 AutoIndexCreatePending(void)
@@ -435,7 +479,9 @@ AutoIndexWorkerMain(Datum main_arg)
 	BackgroundWorkerUnblockSignals();
 
 	BackgroundWorkerInitializeConnection(auto_index_database, NULL, 0);
-
+	
+	/* Session-wide: replaces the old SET LOCAL done through SPI. */
+	SetConfigOption("lock_timeout", "5s", PGC_SUSET, PGC_S_OVERRIDE);
 	for (;;)
 	{
 		CHECK_FOR_INTERRUPTS();
