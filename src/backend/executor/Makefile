@@ -79,6 +79,5 @@ OBJS = \
 	spi.o \
 	tqueue.o \
 	tstoreReceiver.o \
-	autoindex.o 
 
 include $(top_srcdir)/src/backend/common.mk

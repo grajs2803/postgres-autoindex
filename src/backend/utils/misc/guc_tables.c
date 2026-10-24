@@ -57,6 +57,7 @@
 #include "libpq/scram.h"
 #include "nodes/queryjumble.h"
 #include "optimizer/cost.h"
+#include "executor/autoindex.h"
 #include "optimizer/geqo.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/paths.h"
@@ -800,12 +801,11 @@ StaticAssertDecl(lengthof(config_type_names) == (PGC_ENUM + 1),
 struct config_bool ConfigureNamesBool[] =
 {
 	{
-		{"enable_seqscan", PGC_USERSET, QUERY_TUNING_METHOD,
-			gettext_noop("Enables the planner's use of sequential-scan plans."),
-			NULL,
-			GUC_EXPLAIN
+		{"auto_index_enabled", PGC_SUSET, QUERY_TUNING_OTHER,
+			gettext_noop("Tracks sequential-scan equality filters and recommends indexes."),
+			NULL
 		},
-		&enable_seqscan,
+		&auto_index_enabled,
 		true,
 		NULL, NULL, NULL
 	},
@@ -2163,14 +2163,12 @@ struct config_bool ConfigureNamesBool[] =
 struct config_int ConfigureNamesInt[] =
 {
 	{
-		{"archive_timeout", PGC_SIGHUP, WAL_ARCHIVING,
-			gettext_noop("Sets the amount of time to wait before forcing a "
-						 "switch to the next WAL file."),
-			gettext_noop("0 disables the timeout."),
-			GUC_UNIT_S
+		{"auto_index_min_scans", PGC_SUSET, QUERY_TUNING_OTHER,
+			gettext_noop("Minimum number of observed sequential scans before an index is recommended."),
+			NULL
 		},
-		&XLogArchiveTimeout,
-		0, 0, INT_MAX / 2,
+		&auto_index_min_scans,
+		10, 1, INT_MAX,
 		NULL, NULL, NULL
 	},
 	{

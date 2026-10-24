@@ -477,7 +477,8 @@
 #plan_cache_mode = auto			# auto, force_generic_plan or
 					# force_custom_plan
 #recursive_worktable_factor = 10.0	# range 0.001-1000000
-
+#auto_index_enabled = on
+#auto_index_min_scans = 10
 
 #------------------------------------------------------------------------------
 # REPORTING AND LOGGING

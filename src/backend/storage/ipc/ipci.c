@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/clog.h"
+#include "executor/autoindex.h"
 #include "access/commit_ts.h"
 #include "access/multixact.h"
 #include "access/nbtree.h"
@@ -150,6 +151,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, InjectionPointShmemSize());
 	size = add_size(size, SlotSyncShmemSize());
 	size = add_size(size, AioShmemSize());
+	size = add_size(size, AutoIndexShmemSize());
 
 	/* include additional requested shmem from preload libraries */
 	size = add_size(size, total_addin_request);
@@ -342,6 +344,7 @@ CreateOrAttachShmemStructs(void)
 	SyncScanShmemInit();
 	AsyncShmemInit();
 	StatsShmemInit();
+	AutoIndexShmemInit();
 	WaitEventCustomShmemInit();
 	InjectionPointShmemInit();
 	AioShmemInit();
