@@ -801,15 +801,6 @@ StaticAssertDecl(lengthof(config_type_names) == (PGC_ENUM + 1),
 struct config_bool ConfigureNamesBool[] =
 {
 	{
-		{"auto_index_enabled", PGC_SUSET, QUERY_TUNING_OTHER,
-			gettext_noop("Tracks sequential-scan equality filters and recommends indexes."),
-			NULL
-		},
-		&auto_index_enabled,
-		true,
-		NULL, NULL, NULL
-	},
-	{
 		{"enable_indexscan", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of index-scan plans."),
 			NULL,
@@ -2162,33 +2153,6 @@ struct config_bool ConfigureNamesBool[] =
 
 struct config_int ConfigureNamesInt[] =
 {
-	{
-		{"auto_index_min_scans", PGC_SUSET, QUERY_TUNING_OTHER,
-			gettext_noop("Minimum number of observed sequential scans before an index is recommended."),
-			NULL
-		},
-		&auto_index_min_scans,
-		10, 1, INT_MAX,
-		NULL, NULL, NULL
-	},
-	{
-		{"auto_index_max_per_table", PGC_SIGHUP, QUERY_TUNING_OTHER,
-			gettext_noop("Maximum number of automatically created indexes per table."),
-			NULL
-		},
-		&auto_index_max_per_table,
-		3, 0, 1000,
-		NULL, NULL, NULL
-	},
-	{
-		{"auto_index_max_size_mb", PGC_SIGHUP, QUERY_TUNING_OTHER,
-			gettext_noop("Skip automatic indexes whose estimated size exceeds this many megabytes."),
-			NULL
-		},
-		&auto_index_max_size_mb,
-		1024, 1, INT_MAX,
-		NULL, NULL, NULL
-	},
 	{
 		{"post_auth_delay", PGC_BACKEND, DEVELOPER_OPTIONS,
 			gettext_noop("Sets the amount of time to wait after "
@@ -4186,16 +4150,6 @@ struct config_real ConfigureNamesReal[] =
 
 struct config_string ConfigureNamesString[] =
 {
-
-	{
-		{"auto_index_database", PGC_POSTMASTER, QUERY_TUNING_OTHER,
-			gettext_noop("Database in which the auto index worker creates indexes."),
-			NULL
-		},
-		&auto_index_database,
-		"postgres",
-		NULL, NULL, NULL
-	},
 	{
 
 		{"archive_command", PGC_SIGHUP, WAL_ARCHIVING,
